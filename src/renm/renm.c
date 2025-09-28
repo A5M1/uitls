@@ -424,39 +424,45 @@ void cleanAndRenameW(const wchar_t* d, WIN32_FIND_DATAW* f, int dry) {
 		base[len]=0;
 	}
 	else wccopy(base, n);
-
 	char cleaned[260];
 	cleanNameW(base, cleaned, sizeof(cleaned));
-
 	int isdir=(f->dwFileAttributes&0x00000010);
 	if(cleaned[0]==0) { gSkipped++; return; }
-
 	wchar_t newNameW[260];
 	if(dot&&!isdir) {
 		wchar_t cW[260]; toWideChar(cleaned, cW, 260);
 		wccopy(newNameW, cW); wcCat(newNameW, dot);
 	}
 	else toWideChar(cleaned, newNameW, 260);
-
 	if(wcicmp(newNameW, n)!=0) {
-		wchar_t o[260], nn[260];
-		wccopy(o, d); wcCat(o, L"\\"); wcCat(o, n);
-		wccopy(nn, d); wcCat(nn, L"\\"); wcCat(nn, newNameW);
+		size_t dlen=mwcslen(d);
+		size_t nlen=mwcslen(n);
+		size_t nnwlen=mwcslen(newNameW);
+		size_t maxlen=(dlen+1+(nlen>nnwlen ? nlen : nnwlen)+1);
+		wchar_t* o=(wchar_t*)pHeapAlloc(pGetProcessHeap(), 0, maxlen*sizeof(wchar_t));
+		wchar_t* nn=(wchar_t*)pHeapAlloc(pGetProcessHeap(), 0, maxlen*sizeof(wchar_t));
 
-		char oa[260], na[260];
-		wideToUtf8(o, oa, 260); wideToUtf8(nn, na, 260);
-
-		const char* of=oa; const char* nf=na; const char* ls=na;
-		while(*ls) { if(*ls=='\\'||*ls=='/') nf=ls+1; ls++; }
-
-		const char* type=isdir ? "[DIREC] " : "[FILES] ";
-
-		if(dry) {
-			gDryRun++; ansiYellow(); print(type); print(of);
-			print(" -> "); print(nf); print(" [DRY]"); ansiReset(); print("\n");
+		if(!o||!nn) {
+			ansiRed(); printLine("", "Fatal: Out of memory for path construction in cleanAndRenameW");
+			if(o) pHeapFree(pGetProcessHeap(), 0, o);
+			if(nn) pHeapFree(pGetProcessHeap(), 0, nn);
+			gFailed++;
 			return;
 		}
 
+		wccopy(o, d); wcCat(o, L"\\"); wcCat(o, n);
+		wccopy(nn, d); wcCat(nn, L"\\"); wcCat(nn, newNameW);
+		char oa[512], na[512];
+		wideToUtf8(o, oa, 512); wideToUtf8(nn, na, 512);
+		const char* of=oa; const char* nf=na; const char* ls=na;
+		while(*ls) { if(*ls=='\\'||*ls=='/') nf=ls+1; ls++; }
+		const char* type=isdir ? "[DIREC] " : "[FILES] ";
+		if(dry) {
+			gDryRun++; ansiYellow(); print(type); print(of);
+			print(" -> "); print(nf); print(" [DRY]"); ansiReset(); print("\n");
+			pHeapFree(pGetProcessHeap(), 0, o); pHeapFree(pGetProcessHeap(), 0, nn);
+			return;
+		}
 		if(renameExW(o, nn)) {
 			gRenamed++;
 			if(isdir) ansiCyan(); else ansiGreen();
@@ -469,10 +475,56 @@ void cleanAndRenameW(const wchar_t* d, WIN32_FIND_DATAW* f, int dry) {
 			print(type); print(of); print(" -> "); print(nf); print(" [FAILED]");
 			ansiReset(); print("\n");
 		}
+
+		pHeapFree(pGetProcessHeap(), 0, o); pHeapFree(pGetProcessHeap(), 0, nn);
 	}
 	else gSkipped++;
 }
+void processDirsOnlyW(const wchar_t* d, int dry, const wchar_t* root) {
+	if(endsWithNoGallery(d)) {
+		return;
+	}
+	wchar_t s[260]; wccopy(s, d); wcCat(s, L"\\*");
+	WIN32_FIND_DATAW f;
+	HANDLE h=pFindFirstFileW(s, &f);
+	if(h==INVALID_HANDLE_VALUE) {
+		return;
+	}
+	int dir_cap=16, dir_cnt=0;
+	WIN32_FIND_DATAW* dirs=(WIN32_FIND_DATAW*)pHeapAlloc(pGetProcessHeap(), 0, dir_cap*sizeof(WIN32_FIND_DATAW));
+	if(!dirs) { pFindClose(h); return; }
+	do {
+		if(wcCmp(f.cFileName, L".")==0||wcCmp(f.cFileName, L"..")==0) continue;
+		if(f.dwFileAttributes&0x00000010) {
+			if(dir_cnt>=dir_cap) {
+				int nc=dir_cap*2;
+				WIN32_FIND_DATAW* tmp=(WIN32_FIND_DATAW*)pHeapReAlloc(pGetProcessHeap(), 0, dirs, nc*sizeof(WIN32_FIND_DATAW));
+				if(!tmp) { pHeapFree(pGetProcessHeap(), 0, dirs); pFindClose(h); return; }
+				dirs=tmp; dir_cap=nc;
+			}
+			memcpy(&dirs[dir_cnt++], &f, sizeof(WIN32_FIND_DATAW));
+		}
+	}
+	while(pFindNextFileW(h, &f));
+	pFindClose(h);
+	for(int i=0; i<dir_cnt; i++) {
+		size_t dlen=mwcslen(d);
+		size_t nlen=mwcslen(dirs[i].cFileName);
+		size_t path_size=(dlen+1+nlen+1)*sizeof(wchar_t);
+		wchar_t* fullPath=(wchar_t*)pHeapAlloc(pGetProcessHeap(), 0, path_size);
+		if(!fullPath) { continue; }
+		wccopy(fullPath, d);
+		wcCat(fullPath, L"\\");
+		wcCat(fullPath, dirs[i].cFileName);
+		processDirsOnlyW(fullPath, dry, root);
+		pHeapFree(pGetProcessHeap(), 0, fullPath);
+	}
+	for(int i=0; i<dir_cnt; i++) {
+		cleanAndRenameW(d, &dirs[i], dry);
+	}
 
+	pHeapFree(pGetProcessHeap(), 0, dirs);
+}
 void processDirW(const wchar_t* d, int dry, const wchar_t* root) {
 	if(endsWithNoGallery(d)) {
 		if(!isInitialRoot(d, root)) {
@@ -483,11 +535,10 @@ void processDirW(const wchar_t* d, int dry, const wchar_t* root) {
 		}
 		return;
 	}
-
 	wchar_t s[260]; wccopy(s, d); wcCat(s, L"\\*");
 	WIN32_FIND_DATAW f;
 	HANDLE h=pFindFirstFileW(s, &f);
-	if(h==((HANDLE)(intptr_t)-1)) {
+	if(h==INVALID_HANDLE_VALUE) {
 		if(isInitialRoot(d, root)) {
 			char m[300], b[260];
 			wideToUtf8(d, b, 260);
@@ -496,49 +547,65 @@ void processDirW(const wchar_t* d, int dry, const wchar_t* root) {
 		}
 		return;
 	}
-
-	int cap=16, cnt=0;
-	wchar_t** list=(wchar_t**)pHeapAlloc(pGetProcessHeap(), 0, cap*sizeof(wchar_t*));
-	if(!list) { ansiRed(); printLine("", "Fatal: Out of memory allocating dir list"); pFindClose(h); return; }
+	int dir_cap=16, dir_cnt=0;
+	WIN32_FIND_DATAW* dirs=(WIN32_FIND_DATAW*)pHeapAlloc(pGetProcessHeap(), 0, dir_cap*sizeof(WIN32_FIND_DATAW));
+	if(!dirs) { ansiRed(); printLine("", "Fatal: Out of memory allocating dir list"); pFindClose(h); return; }
+	int file_cap=16, file_cnt=0;
+	WIN32_FIND_DATAW* files=(WIN32_FIND_DATAW*)pHeapAlloc(pGetProcessHeap(), 0, file_cap*sizeof(WIN32_FIND_DATAW));
+	if(!files) { ansiRed(); printLine("", "Fatal: Out of memory allocating file list"); pHeapFree(pGetProcessHeap(), 0, dirs); pFindClose(h); return; }
 
 	do {
 		if(wcCmp(f.cFileName, L".")==0||wcCmp(f.cFileName, L"..")==0) continue;
 
 		if(f.dwFileAttributes&0x00000010) {
-			cleanAndRenameW(d, &f, dry);
-			wchar_t full[260]; wccopy(full, d); wcCat(full, L"\\"); wcCat(full, f.cFileName);
-
-			wchar_t* saved=(wchar_t*)pHeapAlloc(pGetProcessHeap(), 0, (mwcslen(full)+1)*sizeof(wchar_t));
-			if(!saved) {
-				ansiRed(); printLine("", "Fatal: Out of memory saving subdir path");
-				for(int i=0; i<cnt; i++) pHeapFree(pGetProcessHeap(), 0, list[i]);
-				pHeapFree(pGetProcessHeap(), 0, list); pFindClose(h); return;
-			}
-			wccopy(saved, full);
-
-			if(cnt>=cap) {
-				int nc=cap*2;
-				wchar_t** tmp=(wchar_t**)pHeapReAlloc(pGetProcessHeap(), 0, list, nc*sizeof(wchar_t*));
+			if(dir_cnt>=dir_cap) {
+				int nc=dir_cap*2;
+				WIN32_FIND_DATAW* tmp=(WIN32_FIND_DATAW*)pHeapReAlloc(pGetProcessHeap(), 0, dirs, nc*sizeof(WIN32_FIND_DATAW));
 				if(!tmp) {
 					ansiRed(); printLine("", "Fatal: Out of memory expanding dir list");
-					pHeapFree(pGetProcessHeap(), 0, saved);
-					for(int i=0; i<cnt; i++) pHeapFree(pGetProcessHeap(), 0, list[i]);
-					pHeapFree(pGetProcessHeap(), 0, list); pFindClose(h); return;
+					pHeapFree(pGetProcessHeap(), 0, files); pHeapFree(pGetProcessHeap(), 0, dirs); pFindClose(h); return;
 				}
-				list=tmp; cap=nc;
+				dirs=tmp; dir_cap=nc;
 			}
-			list[cnt++]=saved;
+			memcpy(&dirs[dir_cnt++], &f, sizeof(WIN32_FIND_DATAW));
 		}
-		else if(hasValidExtensionW(f.cFileName)) cleanAndRenameW(d, &f, dry);
-
+		else if(hasValidExtensionW(f.cFileName)) {
+			if(file_cnt>=file_cap) {
+				int nc=file_cap*2;
+				WIN32_FIND_DATAW* tmp=(WIN32_FIND_DATAW*)pHeapReAlloc(pGetProcessHeap(), 0, files, nc*sizeof(WIN32_FIND_DATAW));
+				if(!tmp) {
+					ansiRed(); printLine("", "Fatal: Out of memory expanding file list");
+					pHeapFree(pGetProcessHeap(), 0, files); pHeapFree(pGetProcessHeap(), 0, dirs); pFindClose(h); return;
+				}
+				files=tmp; file_cap=nc;
+			}
+			memcpy(&files[file_cnt++], &f, sizeof(WIN32_FIND_DATAW));
+		}
 	}
 	while(pFindNextFileW(h, &f));
-
 	pFindClose(h);
-	for(int i=0; i<cnt; i++) { processDirW(list[i], dry, root); pHeapFree(pGetProcessHeap(), 0, list[i]); }
-	pHeapFree(pGetProcessHeap(), 0, list);
-}
+	for(int i=0; i<file_cnt; i++) {
+		cleanAndRenameW(d, &files[i], dry);
+	}
+	pHeapFree(pGetProcessHeap(), 0, files);
+	for(int i=0; i<dir_cnt; i++) {
+		size_t dlen=mwcslen(d);
+		size_t nlen=mwcslen(dirs[i].cFileName);
+		size_t path_size=(dlen+1+nlen+1)*sizeof(wchar_t);
+		wchar_t* fullPath=(wchar_t*)pHeapAlloc(pGetProcessHeap(), 0, path_size);
+		if(!fullPath) {
+			ansiRed(); printLine("", "Fatal: Out of memory for recursion path");
+			continue;
+		}
 
+		wccopy(fullPath, d);
+		wcCat(fullPath, L"\\");
+		wcCat(fullPath, dirs[i].cFileName);
+		processDirW(fullPath, dry, root);
+		pHeapFree(pGetProcessHeap(), 0, fullPath);
+	}
+	pHeapFree(pGetProcessHeap(), 0, dirs);
+}
 void printSummary() {
 	char b[512], t[64];
 	mstrcpyA(b, "\n=== Summary ===\n");
@@ -573,6 +640,8 @@ void wWinMainCRTStartup() {
 		pLocalFree((HGLOBAL)argv);
 	}
 	processDirW(root, dry, root);
+	processDirsOnlyW(root, dry, root);
+
 	printSummary();
 	pExitProcess(0);
 }
